@@ -1,0 +1,406 @@
+#include <FreeRTOS.h>
+#include <task.h>
+#include <semphr.h>
+#include <gpio.h>
+#include "TM4C123.h" // header file for Tiva C controller
+
+// Task handles
+TaskHandle_t xFlameTaskHandle, xBuzzerTaskHandle, xGPSTaskHandle, xWiFiTaskHandle, xEmailTaskHandle;
+
+// Function prototypes for task functions
+void vFlameTask(void *pvParameters);
+void vBuzzerTask(void *pvParameters);
+void vGPSTask(void *pvParameters);
+void vWiFiTask(void *pvParameters);
+void vEmailTask(void *pvParameters);
+
+// Semaphore handles
+SemaphoreHandle_t xFlameSemaphore;
+
+// Flame sensor threshold value
+#define FLAME_SENSOR_THRESHOLD 500
+
+// GPIO configurations
+#define GPIO_PORTF_CLK_EN	 0x20
+#define GPIO_PORTF_PIN1_EN	 0x02
+#define LED_ON1 	         0x02
+#define GPIO_PORTF_PIN2_EN    	 0x04
+#define LED_ON2		 0x04
+#define GPIO_PORTF_PIN3_EN	 0x08
+#define LED_ON3 		 0x08
+
+// GPS configurations
+#define GPIO_PORTA_CLK_EN	 0x01
+#define GPIO_PORTA_PIN0_EN	 0x01
+#define GPS_RX_PIN		 0x01
+#define GPS_RX_PORT		 GPIO_PORTA_BASE
+
+// UART configurations
+#define UART0_BASE		 0x4000C000
+#define UART0_LINE_CTRL		 *((volatile unsigned long *) (UART0_BASE + 0x2C))
+#define UART0_BAUD_RATE_MANT	 *((volatile unsigned long *) (UART0_BASE + 0x14))
+#define UART0_BAUD_RATE_FRAC	 *((volatile unsigned long *) (UART0_BASE + 0x18))
+#define UART0_DATA		 *((volatile unsigned long *) (UART0_BASE + 0x00))
+#define UART0_INT_ENABLE		 *((volatile unsigned long *) (UART0_BASE + 0x1C))
+#define UART0_INT_IDENT		 *((volatile unsigned long *) (UART0_BASE + 0x24))
+#define UART0_FR		 *((volatile unsigned long *) (UART0_BASE + 0x1C))
+#define UART0_DR		 *((volatile unsigned long *) (UART0_BASE + 0x00))
+#define UART0_LCRH		 *((volatile unsigned long *) (UART0_BASE + 0x2C))
+#define UART0_IMSC		 *((volatile unsigned long *) (UART0_BASE + 0x1C))
+#define UART0_ICR		 *((volatile unsigned long *) (UART0_BASE + 0x0C))
+#define UART0_CC		 *((volatile unsigned long *) (UART0_BASE + 0x30))
+#define UART0_IBRD		 *((volatile unsigned long *) (UART0_BASE + 0x24))
+#define UART0_FBRD		 *((volatile unsigned long *) (UART0_BASE + 0x28))
+
+// Wi-Fi configurations
+#define GPIO_PORTE_CLK_EN	 0x10
+#define GPIO_PORTE_PIN4_EN	 0x10
+#define WIFI_RX_PIN		 0x10
+#define WIFI_RX_PORT		 GPIO_PORTE_BASE
+
+// UART configurations
+#define UART1_BASE		 0x4000D000
+#define UART1_LINE_CTRL		 *((volatile unsigned long *) (UART1_BASE + 0x2C))
+#define UART1_BAUD_RATE_MANT	 *((volatile unsigned long *) (UART1_BASE + 0x14))
+#define UART1_BAUD_RATE_FRAC	 *((volatile unsigned long *) (UART1_BASE + 0x18))
+#define UART1_DATA		 *((volatile unsigned long *) (UART1_BASE + 0x00))
+#define UART1_INT_ENABLE		 *((volatile unsigned long *) (UART1_BASE + 0x1C))
+#define UART1_INT_IDENT		 *((volatile unsigned long *) (UART1_BASE + 0x24))
+#define UART1_FR		 *((volatile unsigned long *) (UART1_BASE + 0x1C))
+#define UART1_DR		 *((volatile unsigned long *) (UART1_BASE + 0x00))
+#define UART1_LCRH		 *((volatile unsigned long *) (UART1_BASE + 0x2C))
+#define UART1_IMSC		 *((volatile unsigned long *) (UART1_BASE + 0x1C))
+#define UART1_ICR		 *((volatile unsigned long *) (UART1_BASE + 0x0C))
+#define UART1_CC		 *((volatile unsigned long *) (UART1_BASE + 0x30))
+#define UART1_IBRD		 *((volatile unsigned long *) (UART1_BASE + 0x24))
+#define UART1_FBRD		 *((volatile unsigned long *) (UART1_BASE + 0x28))
+
+// Email configurations
+#define SMTP_SERVER "smtp.gmail.com"
+#define SMTP_PORT 587
+#define EMAIL_FROM "your_email@gmail.com"
+#define EMAIL_TO "recipient_email@gmail.com"
+#define EMAIL_SUBJECT "Fire Alert"
+#define EMAIL_PASSWORD "your_email_password"
+
+int main(void) {
+    // Initialize hardware peripherals and FreeRTOS scheduler
+
+    // Enable clocks for GPIO ports
+    SYSCTL->RCGCGPIO |= GPIO_PORTF_CLK_EN | GPIO_PORTA_CLK_EN | GPIO_PORTE_CLK_EN;
+
+    // Configure GPIO pins
+    GPIO_PORTF_DIR_R |= GPIO_PORTF_PIN1_EN | GPIO_PORTF_PIN2_EN | GPIO_PORTF_PIN3_EN;
+    GPIO_PORTF_DEN_R |= GPIO_PORTF_PIN1_EN | GPIO_PORTF_PIN2_EN | GPIO_PORTF_PIN3_EN;
+    GPIO_PORTA_DIR_R &= ~GPIO_PORTA_PIN0_EN;
+    GPIO_PORTA_DEN_R |= GPIO_PORTA_PIN0_EN;
+    GPIO_PORTE_DIR_R &= ~GPIO_PORTE_PIN4_EN;
+    GPIO_PORTE_DEN_R |= GPIO_PORTE_PIN4_EN;
+
+    // Configure UART for flame sensor
+    UART0_LCRH = 0x70; // 8-bit data, 1 stop bit, no parity
+    UART0_IBRD = 104; // 115200 baud rate
+    UART0_FBRD = 11;
+    UART0_LCRH |= 0x60; // Enable FIFO
+    UART0_IMSC |= 0x1F; // Enable RX and TX interrupts
+    UART0_CC = 0x00; // Disable RS485 mode
+    UART0_ICR = 0x7FF; // Clear interrupts
+    UART0_IMSC |= 0x1F; // Enable RX and TX interrupts
+    NVIC_EnableIRQ(UART0_IRQn);
+
+    // Configure UART for GPS
+    UART1_LCRH = 0x70; // 8-bit data, 1stop bit, no parity
+    UART1_IBRD = 104; // 9600 baud rate
+    UART1_FBRD = 11;
+    UART1_LCRH |= 0x60; // Enable FIFO
+    UART1_IMSC |= 0x1F; // Enable RX and TX interrupts
+    UART1_CC = 0x00; // Disable RS485stop bit, no parity
+    UART1_IBRD = 104; // 9600 baud rate
+    UART1_FBRD = 11;
+    UART1_LCRH |= 0x60; // Enable FIFO
+    UART1_IMSC |= 0x1F; // Enable mode
+    UART1_ICR = 0x7FF; // Clear interrupt RX and TX interrupts
+    UART1_CC = 0x00s
+    UART1_IMSC |= 0x1F; // Enable RX and TX interrupts
+    NVIC_EnableIRQ; // Disable RS485 mode
+    UART1_ICR = 0x7FF; // Clear interrupts
+    UART1_(UART1_IRQn);
+
+    // Create semaphoreIMSC |= 0x1F; // Enable RX and TX interrupts
+    NVIC_EnableIRQ(UART1_IRQn);
+
+    xFlameSemaphore = xSemaphoreCreate
+    // Create semaphore
+    xFlameSemaphore = xSemaphoreCreateBinary();
+
+    // Create tasks
+    xTaskCreate(vFlameTask, "FlameTask", configMINIMBinary();
+
+    // Create tasks
+    xTaskCreate(vFlameTask, "FlAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + ameTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 11, &xFlameTaskHandle);
+    xTaskCreate(vBuzzerTask, "BuzzerTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 2, &xBuzzerTaskHandle);
+    x, &xFlameTaskHandle);
+    xTaskCreate(vBuzzerTask,TaskCreate(vGPSTask, "GPSTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 3, &xGPSTask "BuzzerTask", configMINIMAL_STACK_SIZE, NULL,Handle);
+    xTaskCreate(vWiFiTask, "WiFiTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY +  tskIDLE_PRIORITY + 2, &xBuzzerTaskHandle);
+    xTask4, &xWiFiTaskHandle);
+    xTaskCreate(vEmailTask, "EmailTask",Create(vGPSTask, "GPSTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 3, &xGPSTaskHandle); configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 5, &xEmailTaskHandle);
+
+    // Start FreeRTOS scheduler
+    vTaskStartScheduler();
+
+    // Should never reach here
+    for (;;);
+}
+
+// Task function for Fl
+    xTaskCreate(vWiFiTask, "WiFiTask", configMINIMAL_STame Sensor Calibration and Fire Detection
+void vFlameTask(void *pvParameters) {
+    // Initialize flame sensorACK_SIZE, NULL, tskIDLE_PRIORITY + 4, &xWiFiTaskHandle);
+    xTaskCreate(vEmailTask, "EmailTask", configMINIMAL_ GPIO
+    GPIOPinTypeGPIOInput(FLAME_SENSOR_GPIO_PORT, FLAME_SENSOR_GPIO_PIN);
+STACK_SIZE, NULL, tskIDLE
+    while (1) {
+        // Read flame sensor value
+        int flameSensorValue = GPIOPinRead(FLAME_SENSOR_GPIO_PORT, FLAME_SENSOR__PRIORITY + 5, &xEmailTaskHandle);GPIO_PIN);
+
+        // Check if flame is detected
+
+
+    // Start FreeRTOS scheduler
+    vTaskStartScheduler();
+
+    // Should never reach here
+    for        if (flameSensorValue != 0) {
+            // Give semaphore to indicate flame detected
+            xSemaphoreGiveFromISR(xFlameSemaphore, pdFALSE);
+        }
+
+        // Wait for a short period of time before checking again
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+ (;;);
+}
+
+// Task function for Flame Sensor Calibration and Fire Detection
+void v}
+
+// Task function for Buzzer
+void vBuzzerTask(void *pvParameters) {
+    // Initialize buzzer GPIO
+    GPIOPinTypeGPIOOutput(BUZZFlameTask(void *pvParameters) {
+    // Initialize flame sensorER_GPIO_PORT, BUZZER_GPIO_PIN);
+
+    while (1) {
+ GPIO
+    GPIOPinTypeGPIOInput(FLAME_SENSOR_GPIO_PORT, FLAME_SENSOR_GPIO_PIN);
+        // Wait for flame semaphore to be given
+        xSemaphore
+    while (1) {
+        // Read flame sensor value
+        int flameSensorValue = GPIOPinRead(FLAME_SENSOR_GPIO_PORT, FLAME_SENSOR_GPIO_PIN);Take(xFlameSemaphore, portMAX_DELAY);
+
+        // Turn on buzzer
+        GPIOPinWrite(BUZZER_GPIO_PORT, BUZZER_GPIO_PIN, BUZZER_GPIO_PIN);
+
+
+        // Check if flame is detected
+        if (flameSensorValue != 0) {
+            // Give semaphore to indicate flame
+        // Wait for a short period of time before turning off buzzer
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+        // Turn off buzzer
+        GPIOPinWrite(BUZZER_GPIO_PORT, detected
+            xSemaphoreGiveFromISR(xFlameSemaphore, pdFALSE);
+        }
+
+        // Wait for a short period of time BUZZER_GPIO_PIN, 0);
+    }
+}
+
+// Task functionfor GPS Module Configuration and Location Retrieval
+void vGPSTask(void *pvParameters) {
+    // Implement GPS module configuration and location retrieval logic here
+
+    // Example code to read data from GPS module
+    char gpsData[100];
+    while (1) {
+        // Wait for GPS data to be available
+        while (GPIOPinRead(GPS_RX before checking again
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+// Task function for Buzzer
+void v_PORT, GPS_RX_PIN) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        // Read GPS data
+        int i =BuzzerTask(void *pvParameters) {
+    // Initialize buzzer GPIO
+    GPIOPinTypeGPIOOutput(BUZZER_ 0;
+        while (GPIOPinRead(GPS_RX_PORT, GPS_RX_PIN) != 0) {
+            gpsData[i++] = UART1_DR & 0xFF;
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        gpsData[i] = '\0';
+
+        // Print GPS data to console
+        printfGPIO_PORT, BUZZER_GPIO_PIN);
+
+    while (1) {
+        // Wait for flame semaphore to be given("%s", gpsData);
+
+        // Wait for a short period of time before checking again
+        vTaskDelay(pdMS_
+        xSemaphoreTake(xFlameSemaphore, portMAX_DELAY);
+
+        // Turn on buzzer
+TO_TICKS(1000));
+    }
+}
+
+// Task function for Wi-Fi Module Configuration and Connection
+void vWiFiTask(void *pvParameters) {
+    // Implement Wi-Fi module configuration and connection logic here
+
+    // Example code to send data over Wi-Fi
+    char wiFiData[100];
+    while (1) {
+        // Wait for Wi-Fi data to be available
+        while (GPIOPinRead(WIFI_RX_PORT, WIFI_RX_PIN) ==        GPIOPinWrite(BUZZER_GPIO_PORT, BUZZER_GPIO_PIN, BUZZ 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        // Read Wi-Fi data
+        int i = 0;
+        while (GPIOPinRead(WIFI_RX_PORT, WIFI_RX_PIN) != 0) {
+            wiFiData[i++] = UART1_DR & 0xFFER_GPIO_PIN);
+
+        // Wait for a short period of time before turning off buzzer
+        vTaskDelay(pdMS_TO_TICKS(500));
+;
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        wiFiData[i] = '\0';
+
+        // Print Wi-Fi data to console
+        printf("%s", wiFiData);
+
+        // Wait for a short period of time before checking again
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+        // Turn off buzzer
+        GPIOPinWrite(BU
+}
+
+// Task function for Email Sending via SMTP
+void vEmailTask(void *pvParameters) {
+    // Implement email sending logic via SMTP here
+
+    // Example code to send email
+    while (1) {
+        // Wait for trigger to send email
+        xSemZZER_GPIO_PORT, BUZZER_GPIO_PIN, 0);
+    }
+}
+
+// Task functionfor GPS Module Configuration and Location Retrieval
+void vGPSTask(void *pvParameters) {
+    // Implement GPS module configuration and location retrieval logic here
+
+    // Example code to read data from GPSaphoreTake(xFlameSemaphore, portMAX_DELAY);
+
+        // Connect to SMTP server
+        char atCommand[100];
+        sprintf(atCommand, "AT+CIPSTART=\"TCP\",\"%s\",%d\r\n", SMTP_SERVER, SMTP_PORT);
+        UART module
+    char gpsData[100];
+    while (1) {
+        // Wait for GPS data to be available
+        while (GPIOPinRead(GPS_RX_1_DATA = atCommand[0];
+        vTaskDelay(pdMS_TO_TICKS(10));
+        UART1_DATA = atCommand[1];
+        vTaskDelay(pdMS_TO_TICKS(10));
+        // ... continue sending AT commands to connect to SMTP server
+
+        // Send email
+        char emailCommand[100];
+        sprintf(emailCommand, "AT+CM
+```PORT, GPS_RX_PIN) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        // Read GPS data
+        int i = 0;
+        while (GPIOPinRead(GPS_RX_PORT, GPS_RX_PIN) != 0) {
+            gpsData[i++] = UART1_DR & 0xFF;
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        gpsData[i] = '\0';
+
+        // Print GPS data to console
+        printf("%s", gpsData);
+
+        // Wait for a short period of time before checking again
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+// Task function for Wi-Fi Module Configuration and Connection
+void vWiFiTask(void *pvParameters) {
+    // Implement Wi-Fi module configuration and connection logic here
+
+    // Example code to send data over Wi-Fi
+    char wifiData[100];
+    while (1) {
+        // Wait for Wi-Fi data to be available
+        while (GPIOPinRead(WIFI_RX_PORT, WIFI_RX_PIN) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        // Read Wi-Fi data
+        int i = 0;
+        while (GPIOPinRead(WIFI_RX_PORT, WIFI_RX_PIN) != 0) {
+            wifiData[i++] = UART1_DR & 0xFF;
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        wifiData[i] = '\0';
+
+        // Print Wi-Fi data to console
+        printf("%s", wifiData);
+
+        // Wait for a short period of time before checking again
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+// Task function for Email Sending via SMTP
+void vEmailTask(void *pvParameters) {
+    // Implement email sending logic via SMTP here
+
+    // Example code to send email
+    while (1) {
+        // Wait for trigger to send email
+        xSemaphoreTake(xFlameSemaphore, portMAX_DELAY);
+
+        // Connect to SMTP server
+        char atCommand[100];
+        sprintf(atCommand, "AT+CIPSTART=\"TCP\",\"%s\",%d\r\n", SMTP_SERVER, SMTP_PORT);
+        UART1_DATA = atCommand[0];
+        for (int i = 1; atCommand[i] != '\0'; i++) {
+            while (UART1_FR & 0x20) {}
+            UART1_DATA = atCommand[i];
+        }
+        while (1) {
+            while (UART1_FR & 0x20) {}
+            char c = UART1_DR & 0xFF;
+            if (c == '\r') {
+                break;
+            }
+        }
+
+        // Send email
+        char sendCommand[100];
+        sprintf(sendCommand, "AT+CM

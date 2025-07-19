@@ -1,0 +1,186 @@
+#include "inc/hw_memmap.h"
+#include "inc/hw_types.h"
+#include "driverlib/gpio.h"
+#include "driverlib/sysctl.h"
+#include "driverlib/uart.h"
+#include "driverlib/pwm.h"
+#include "driverlib/sysctl.h"
+#include "driverlib/adc.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+#include "email.h"
+#include "gps.h"
+#include "wifi.h"
+
+// Flame sensor calibration parameters
+#define FL_SENSOR_CALIBRATION_THRESHOLD 300
+#define FL_SENSOR_CALIBRATION_PERIOD 1000
+
+// Buzzer activation parameters
+#define BUZZER_PIN 0
+#define BUZZER_ON_DURATION 500
+
+// GPS configuration parameters
+#define GPS_UART_BASE UART5_BASE
+#define GPS_UART_PERIPH_CLOCK_ENABLE SYSCTL_PERIPH_UART5
+#define GPS_UART_CLOCK_FREQUENCY SYSCTL_CLK_FREQ
+#define GPS_UART_PIN_MASK (GPIO_PIN_0 | GPIO_PIN_1)
+#define GPS_UART_GPIO_PORT GPIO_PORTE_BASE
+#define GPS_UART_GPIO_PERIPH_CLOCK_ENABLE SYSCTL_PERIPH_GPIOE
+#define GPS_UART_RX_PIN GPIO_PIN_0
+#define GPS_UART_TX_PIN GPIO_PIN_1
+
+// Wi-Fi configuration parameters
+#define WIFI_UART_BASE UART6_BASE
+#define WIFI_UART_PERIPH_CLOCK_ENABLE SYSCTL_PERIPH_UART6
+#define WIFI_UART_CLOCK_FREQUENCY SYSCTL_CLK_FREQ
+#define WIFI_UART_PIN_MASK (GPIO_PIN_0 | GPIO_PIN_1)
+#define WIFI_UART_GPIO_PORT GPIO_PORTF_BASE
+#define WIFI_UART_GPIO_PERIPH_CLOCK_ENABLE SYSCTL_PERIPH_GPIOF
+#define WIFI_UART_RX_PIN GPIO_PIN_0
+#define WIFI_UART_TX_PIN GPIO_PIN_1
+
+// Email configuration parameters
+#define SMTP_SERVER "smtp.gmail.com"
+#define SMTP_PORT 587
+#define FROM_EMAIL "your_email@gmail.com"
+#define FROM_EMAIL_PASSWORD "your_email_password"
+#define TO_EMAIL "recipient_email@gmail.com"
+
+// Global variables
+SemaphoreHandle_t xFlameSensorSemaphore;
+SemaphoreHandle_t xGPSDataSemaphore;
+SemaphoreHandle_t xWiFiDataSemaphore;
+
+// Task prototypes
+void vFlameSensorTask(void *params);
+void vBuzzerTask(void *params);
+void vGPSDataTask(void *params);
+void vWiFiDataTask(void *params);
+void vEmailTask(void *params);
+
+// Main function
+int main(void) {
+    // Initialize system clock
+    SysCtlClockSet(SYSCTL_SYSDIV_4 | SYSCTL_USE_PLL | SYSCTL_OSC_MAIN | SYSCTL_XTAL_16MHZ);
+
+    // Initialize GPIO
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
+    GPIOPinTypeGPIOOutput(GPIO_PORTF_BASE, 1 << BUZZER_PIN);
+
+    // Initialize flame sensor
+    xFlameSensorSemaphore = xSemaphoreCreateBinary();
+    GPIOPinTypeGPIOInput(GPIO_PORTF_BASE, 1 << 4);
+    GPIOPadConfigSet(GPIO_PORTF_BASE, 1 << 4, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+    ADCClockConfigSet(ADC0_BASE, ADC_CLOCK_SRC_PLL | ADC_CLOCK_FRQ_FULL);
+    ADCSequenceConfigure(ADC0_BASE, 3, ADC_TRIGGER_PROCESSOR, 0);
+    ADCSequenceStepConfigure(ADC0_BASE, 3, 0, ADC_CTL_CH0 | ADC_CTL_IE | ADC_CTL_END);
+    ADCSequenceEnable(ADC0_BASE, 3);
+
+    // Initialize buzzer
+    GPIOPinWrite(GPIO_PORTF_BASE, 1 << BUZZER_PIN, 0);
+
+    // Initialize GPS
+    GPS_Init(GPS_UART_BASE, GPS_UART_PERIPH_CLOCK_ENABLE, GPS_UART_CLOCK_FREQUENCY, GPS_UART_PIN_MASK, GPS_UART_GPIO_PORT, GPS_UART_GPIO_PERIPH_CLOCK_ENABLE, GPS_UART_RX_PIN, GPS_UART_TX_PIN);
+    xGPSDataSemaphore = xSemaphoreCreateBinary();
+
+    // Initialize Wi-Fi
+    WIFI_Init(WIFI_UART_BASE, WIFI_UART_PERIPH_CLOCK_ENABLE, WIFI_UART_CLOCK_FREQUENCY, WIFI_UART_PIN_MASK, WIFI_UART_GPIO_PORT, WIFI_UART_GPIO_PERIPH_CLOCK_ENABLE, WIFI_UART_RX_PIN, WIFI_UART_TX_PIN);
+    xWiFiDataSemaphore = xSemaphoreCreateBinary();
+
+    // Initialize email
+    Email_Init(SMTP_SERVER, SMTP_PORT, FROM_EMAIL, FROM_EMAIL_PASSWORD, TO_EMAIL);
+
+    // Create tasks
+    xTaskCreate(vFlameSensorTask, "FlameSensorTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
+    xTaskCreate(vBuzzerTask, "BuzzerTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 2, NULL);
+    xTaskCreate(vGPSDataTask, "GPSDataTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 3, NULL);
+    xTaskCreate(vWiFiDataTask, "WiFiDataTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 4, NULL);
+    xTaskCreate(vEmailTask, "EmailTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 5, NULL);
+
+    // Start scheduler
+    vTaskStartScheduler();
+
+    // Should never reach here
+    while (1) {
+    }
+}
+
+// Flame sensor task
+void vFlameSensorTask(void *params) {
+    uint32_t ui32ADCValue;
+    uint32_t ui32CalibrationValue;
+    uint32_t ui32PeriodCounter;
+
+    // Calibrate flame sensor
+    ADCSequenceStepConfigure(ADC0_BASE, 3, 0, ADC_CTL_CH0 | ADC_CTL_IE | ADC_CTL_END);
+    ADCSequenceEnable(ADC0_BASE, 3);
+    ui32CalibrationValue = 0;
+    for (ui32PeriodCounter = 0; ui32PeriodCounter < FL_SENSOR_CALIBRATION_PERIOD; ui32PeriodCounter++) {
+        ADCSequenceDataGet(ADC0_BASE, 3, &ui32ADCValue);
+        ui32CalibrationValue += ui32ADCValue;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    ui32CalibrationValue /= FL_SENSOR_CALIBRATION_PERIOD;
+
+    // Main flame sensor loop
+    while (1) {
+        ADCSequenceDataGet(ADC0_BASE, 3, &ui32ADCValue);
+        if (ui32ADCValue > ui32CalibrationValue + FL_SENSOR_CALIBRATION_THRESHOLD) {
+            // Fire detected
+            xSemaphoreGiveFromISR(xFlameSensorSemaphore, pdFALSE);
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+// Buzzer task
+void vBuzzerTask(void *params) {
+    while (1) {
+        xSemaphoreTake(xFlameSensorSemaphore, portMAX_DELAY);
+        GPIOPinWrite(GPIO_PORTF_BASE, 1 << BUZZER_PIN, 1 << BUZZER_PIN);
+        vTaskDelay(pdMS_TO_TICKS(BUZZER_ON_DURATION));
+        GPIOPinWrite(GPIO_PORTF_BASE, 1 << BUZZER_PIN, 0);
+    }
+}
+
+// GPS data task
+void vGPSDataTask(void *params) {
+    char gpsData[100];
+
+    while (1) {
+        if (xSemaphoreTake(xGPSDataSemaphore, portMAX_DELAY) == pdTRUE) {
+            GPS_ReadData(gpsData, sizeof(gpsData));
+            // Process GPS data here
+        }
+    }
+}
+
+// Wi-Fi data task
+void vWiFiDataTask(void *params) {
+    char wiFiData[100];
+
+    while (1) {
+        if (xSemaphoreTake(xWiFiDataSemaphore, portMAX_DELAY) == pdTRUE) {
+            WIFI_ReadData(wiFiData, sizeof(wiFiData));
+            // Process Wi-Fi data here
+        }
+    }
+}
+
+// Email task
+void vEmailTask(void *params) {
+    char subject[50];
+    char message[100];
+
+    while (1) {
+        // Wait for trigger to send email
+        // ...
+
+        // Send email
+        strcpy(subject, "Fire Alert");
+        sprintf(message, "Fire detected at location: %s", GPS_GetLocation());
+        Email_Send(subject, message);
+    }
+}
